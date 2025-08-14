@@ -1,0 +1,119 @@
+---
+title: "Transaction Data"
+output: html_document
+date: "2025-05-28"
+---
+
+This code processes multiple municipality-level transaction datasets from the Mexican Central Bank. It cleans, reshapes, and merges the data, retaining only December records to create consistent annual snapshots at the municipality level.
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+```
+
+```{r}
+
+load_required_packages <- function(pkgs) {
+  for (pkg in pkgs) {
+    if (!requireNamespace(pkg, quietly = TRUE)) {
+      install.packages(pkg)
+    }
+    library(pkg, character.only = TRUE)
+  }
+}
+
+load_required_packages(c("dplyr", "tidyr", "readr", "purrr", "janitor", "scales", "knitr"))
+
+
+```
+
+
+```{r}
+# -----------------------------------------
+# Function to clean and reshape Transactions datasets
+# -----------------------------------------
+
+process_file <- function(filename, value_col_name = "Value", id_cols = c("Mont", "Year")) {
+  df <- read.csv(filename)
+
+  # Remove thousands separators and convert character columns to numeric
+  df[] <- lapply(df, function(x) {
+    if (is.character(x)) {
+      as.numeric(gsub(",", "", x))
+    } else {
+      x}})
+
+  # Convert from wide to long format
+  df_long <- df %>%
+    pivot_longer(
+      cols = -all_of(id_cols),
+      names_to = "CLAVE",
+      values_to = value_col_name) %>%
+    mutate(
+      CLAVE = as.integer(sub("^X", "", CLAVE)),
+      !!value_col_name := as.numeric(.data[[value_col_name]]))
+
+  # Rename first ID column to "Month"
+  if (length(id_cols) > 0) {
+    names(df_long)[1] <- "Month"}
+  return(df_long)}
+```
+
+
+
+
+```{r}
+# -----------------------------------------
+# Process each financial Transactions file
+# -----------------------------------------
+
+establishments    <- process_file("Data/Transactions/TPV.csv", value_col_name = "Establecimientos")
+transactions_pos  <- process_file("Data/Transactions/Transacciones.csv", value_col_name = "Transacciones")
+branches          <- process_file("Data/Transactions/Sucursales.csv", value_col_name = "Sucursales")
+atms              <- process_file("Data/Transactions/Cajeros.csv", value_col_name = "Cajeros")
+atm_operations    <- process_file("Data/Transactions/Operaciones_cajeros.csv", value_col_name = "Operaciones")
+terminals         <- process_file("Data/Transactions/Terminales.csv", value_col_name = "Terminales")
+debit             <- process_file("Data/Transactions/debito.csv", value_col_name = "Debito")
+mobile            <- process_file("Data/Transactions/bancamovil.csv", value_col_name = "Movil")
+staff             <- process_file("Data/Transactions/personal.csv", value_col_name = "Personal")
+credit            <- process_file("Data/Transactions/credito.csv", value_col_name = "Credito")
+
+```
+
+
+```{r}
+
+# -----------------------------------------
+# Combine all processed data into a single dataset
+# -----------------------------------------
+
+df_list <- list( establishments, transactions_pos, branches, atms, atm_operations,
+  terminals, debit, mobile, staff, credit)
+
+# Merge by Month, Year, and CLAVE
+transactions <- reduce(df_list, full_join, by = c("Month", "Year", "CLAVE"))
+
+# -----------------------------------------
+# Keep only December records at the municipality level
+# -----------------------------------------
+
+transactions_annual <- transactions %>%
+  filter(Month == 12, CLAVE > 999) %>%  # Exclude state-level aggregates
+  group_by(Year, CLAVE) %>%
+  summarise(across(.cols = -Month, ~ .x, .names = "{.col}"), .groups = "drop")
+
+# -----------------------------------------
+# Save cleaned and annualized dataset
+# -----------------------------------------
+
+write_csv(transactions_annual, file.path("data/output", "transactions.csv"))
+
+```
+
+```{r}
+transactions <- read_csv("data/output/transactions.csv")
+kable(head(transactions, 10))
+```
+
+

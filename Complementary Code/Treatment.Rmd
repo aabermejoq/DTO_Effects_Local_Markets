@@ -1,0 +1,564 @@
+---
+title: "Treatment"
+output: html_document
+date: "2025-05-28"
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+```
+
+```{r}
+
+load_required_packages <- function(pkgs) {
+  for (pkg in pkgs) {
+    if (!requireNamespace(pkg, quietly = TRUE)) {
+      install.packages(pkg)
+    }
+    library(pkg, character.only = TRUE)
+  }
+}
+
+required_packages <- c(
+  "tidyr", "dplyr", "purrr", "readxl", "readr", "janitor", "ggplot2", "scales",
+  "lubridate", "caret", "randomForest", "geosphere", "MatchIt", "CBPS", "sf",
+  "factoextra", "rddtools", "hrbrthemes", "rdrobust", "stringr", "tibble", "rnaturalearth", "rnaturalearthdata", "cowplot"
+)
+
+
+load_required_packages(required_packages)
+
+
+```
+
+
+```{r}
+
+# --- Load and clean data ---
+
+# Load data
+OCVED <- read_csv("data/input/OCVED_data.csv")
+demographics <- read_xlsx("data/input/demograficos.xlsx")
+
+# Clean OCVED and extract Year
+OCVED_clean <- OCVED %>%
+  mutate(
+    date = ymd(as.character(date)),
+    Year = year(date),
+    mun = as.character(mun)
+  ) %>%
+  filter(!is.na(date))%>%
+  filter(counter>=1)
+
+# Get all unique years and municipalities
+all_years <- sort(unique(OCVED_clean$Year))
+all_munis <- sort(unique(demographics$CLAVE)) %>% as.character()
+
+# Create full municipality-year grid
+muni_year_grid <- expand.grid(
+  mun = all_munis,
+  Year = all_years,
+  stringsAsFactors = FALSE
+)
+
+# Summarize reports by mun and year
+reports_df <- OCVED_clean %>%
+  group_by(mun, Year) %>%
+  summarise(
+    reports = sum(counter, na.rm = TRUE),
+    DTOs    = n_distinct(actor_main, na.rm = TRUE),
+    longitude = mean(longitude, na.rm = TRUE),  
+    latitude = mean(latitude, na.rm = TRUE),  
+    .groups = "drop"
+  ) %>%
+  filter(reports >= 1)
+
+# Clean demographics with correct population column and consistent types
+demographics_clean <- demographics %>%
+  rename(Year = AÑO, POB = POB_MIT_MUN, mun = CLAVE) %>%
+  filter(Year > 1999, Year < 2020) %>%
+  mutate(
+    mun = as.character(mun),
+    Year = as.integer(Year)
+  ) %>%
+  dplyr::select(mun, Year, POB)
+
+# Join reports and demographics on full muni-year grid
+narco_df <- muni_year_grid %>%
+  left_join(reports_df, by = c("mun", "Year")) %>%
+  mutate(reports = replace_na(reports, 0)) %>%
+  mutate(DTOs = replace_na(DTOs, 0)) %>%
+  left_join(demographics_clean, by = c("mun", "Year")) %>%
+  mutate(
+    tasa = if_else(is.na(POB), NA_real_, reports / POB * 100000)
+  )
+
+reports_df%>%arrange(desc(reports))
+```
+
+```{r}
+
+# --- One map per year  ---
+make_dto_map <- function(year_to_plot) {
+  df_year <- reports_df %>%
+    filter(Year == year_to_plot, !is.na(longitude), !is.na(latitude)) %>%
+    mutate(DTO_class = ifelse(DTOs == 1, "Single DTO", "Multiple DTOs"))
+  
+  points_sf <- st_as_sf(df_year, coords = c("longitude", "latitude"), crs = 4326)
+  mex_sf <- rnaturalearth::ne_countries(country = "Mexico", returnclass = "sf")
+  
+  ggplot() +
+    geom_sf(data = mex_sf, fill = "gray98", color = "black", linewidth = 0.4) +
+    geom_sf(data = points_sf, aes(size = reports, color = DTO_class), alpha = 0.4) +
+    scale_size_continuous(
+      name   = "Reports (count)",
+      range  = c(1, 3.5),
+      trans  = "sqrt",
+      breaks = c(1, 10, 100, 200, 300),
+      labels = c("1", "10", "100", "200", "300")
+    ) +
+    scale_color_manual(
+      name   = "Type",
+      values = c("Single DTO" = "#20B2AA", "Multiple DTOs" = "#E67E22")
+    ) +
+    labs(title = as.character(year_to_plot)) +  
+    coord_sf() +
+    theme_minimal(base_size = 12) +
+    theme(
+      legend.position  = "none",       
+      panel.grid       = element_blank(),
+      axis.text        = element_blank(),
+      axis.ticks       = element_blank(),
+      axis.title       = element_blank(),
+      plot.title       = element_text(face = "plain", hjust = 0.5)
+    )
+}
+
+# Years to show
+years <- c(2005, 2008, 2012, 2018)
+
+# Build panels
+maps_list <- lapply(years, make_dto_map)
+grid_maps <- plot_grid(plotlist = maps_list, ncol = 2)
+
+# --- Global legend ---
+legend_plot <- {
+  df_year <- reports_df %>%
+    filter(Year == years[1], !is.na(longitude), !is.na(latitude)) %>%
+    mutate(DTO_class = ifelse(DTOs == 1, "Single DTO", "Multiple DTOs"))
+  points_sf <- st_as_sf(df_year, coords = c("longitude", "latitude"), crs = 4326)
+  
+  ggplot() +
+    geom_sf(data = points_sf, aes(size = reports, color = DTO_class), alpha = 0.8) +
+    scale_size_continuous(
+      name   = "No. Reports",
+      range  = c(1, 5),
+      trans  = "sqrt",
+      breaks = c(1, 10, 100, 200, 300),
+      labels = c("1", "10", "100", "200", "300")
+    ) +
+    scale_color_manual(
+      name   = "Type",
+      values = c("Single DTO" = "#20B2AA", "Multiple DTOs" = "#E67E22")
+    ) +
+    guides(size = guide_legend(order = 1, override.aes = list(alpha = 1)),
+           color = guide_legend(order = 2)) +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "right",
+          panel.grid = element_blank(),
+          axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          axis.title = element_blank())
+}
+legend_grob <- cowplot::get_legend(legend_plot)
+
+
+body_with_legend <- plot_grid(grid_maps, legend_grob, ncol = 2, rel_widths = c(1, 0.22))
+
+final_plot <- ggdraw() +
+  draw_label("Evolution of DTO Presence in Mexico — Selected Years",
+             fontface = "bold", x = 0.02, y = 0.975, hjust = 0, size = 16) +
+  draw_plot(body_with_legend, y = 0.08, height = 0.86) +
+  draw_label("Source: Osorio (2020)",
+             x = 0.5, y = 0.025, size = 12)
+
+ggsave("DTO_grid.png", plot = final_plot, width = 11, height = 8, dpi = 300)
+
+```
+
+
+
+
+```{r}
+
+valid_tasa <- narco_df %>%
+  filter(!is.na(tasa) & tasa > 0)
+
+prom_coords <- read_csv("data/output/prom_coords.csv") 
+
+percentile_thresholds <- quantile(valid_tasa$tasa, probs = seq(0, 0.9, by = 0.1), na.rm = TRUE)
+all_thresholds <- c(percentile_thresholds, NA)
+all_names <- c(paste0("treatment_percentile_", seq(0, 90, by = 10)), "treatment_reports_gt_0")
+
+```
+
+
+
+```{r}
+# -----------------------------
+# --- Prep keys & neighbors ---
+# -----------------------------
+
+# Standardize keys/types and calculate 'rate' once
+narco_df <- narco_df %>%
+  mutate(
+    mun    = as.character(mun),
+    Year   = as.integer(Year),
+    reports = coalesce(reports, 0L),
+    DTOs    = coalesce(DTOs, 0L),
+    rate    = as.numeric(tasa)
+  )
+
+prom_coords <- prom_coords %>%
+  mutate(CLAVE = as.character(CLAVE)) %>%
+  filter(!is.na(lon_prom), !is.na(lat_prom))
+```
+
+
+```{r}
+# Precompute neighbors (top 10 nearest by Haversine)
+get_top10_neighbors_wide <- function(current_row, data) {
+  current_coord <- c(current_row$lon_prom, current_row$lat_prom)
+  all_coords <- data %>% dplyr::select(lon_prom, lat_prom)
+  distances <- geosphere::distHaversine(current_coord, as.matrix(all_coords)) / 1000
+
+  dist_df <- data.frame(
+    CLAVE = data$CLAVE,
+    distance_km = distances
+  ) %>%
+    dplyr::filter(CLAVE != current_row$CLAVE) %>%
+    dplyr::arrange(distance_km) %>%
+    dplyr::slice_head(n = 10)
+
+  # ensure neighbor_1..neighbor_10 exist even if <10 rows
+  neigh_names <- paste0("neighbor_", 1:10)
+  neighbors <- setNames(as.list(rep(NA_character_, 10)), neigh_names)
+  got <- setNames(as.list(dist_df$CLAVE), paste0("neighbor_", seq_len(nrow(dist_df))))
+  neighbors[names(got)] <- got
+
+  tibble::tibble(CLAVE = current_row$CLAVE, !!!neighbors)
+}
+
+neighbors_wide_df <- dplyr::bind_rows(
+  lapply(1:nrow(prom_coords), function(i) get_top10_neighbors_wide(prom_coords[i, ], prom_coords))
+) %>%
+  dplyr::mutate(CLAVE = as.character(CLAVE))
+```
+
+
+```{r}
+# Base grid (municipality-year) + neighbors for all years
+years_available <- sort(unique(as.integer(narco_df$Year)))
+
+neighbors_expanded <- expand.grid(
+  CLAVE = neighbors_wide_df$CLAVE,
+  year  = years_available,
+  stringsAsFactors = FALSE
+) %>%
+  dplyr::mutate(CLAVE = as.character(CLAVE)) %>%
+  dplyr::left_join(neighbors_wide_df, by = "CLAVE")
+```
+
+```{r}
+# -----------------------------
+# --- Master base (once) ---
+# -----------------------------
+
+# Build full (mun, Year) grid ONCE
+full_grid <- tidyr::expand_grid(
+  mun  = unique(narco_df$mun),
+  Year = years_available
+)
+
+# Attach invariant variables (reports, DTOs, rate)
+master_base <- full_grid %>%
+  dplyr::left_join(
+    narco_df %>%
+      dplyr::select(mun, Year, reports, DTOs, rate) %>%
+      dplyr::distinct(),
+    by = c("mun", "Year")
+  ) %>%
+  dplyr::mutate(
+    reports = dplyr::coalesce(reports, 0L),
+    DTOs    = dplyr::coalesce(DTOs, 0L),
+    rate    = rate  # keep NA as NA
+  )
+
+# -----------------------------
+# --- Precompute neighbor edges ---
+# -----------------------------
+
+
+neighbor_edges <- neighbors_expanded %>%
+  tidyr::pivot_longer(
+    cols             = dplyr::starts_with("neighbor_"),
+    names_to         = NULL,
+    values_to        = "neighbor_mun",
+    values_drop_na   = TRUE
+  ) %>%
+  dplyr::rename(mun = CLAVE, Year = year)
+
+# -----------------------------
+# --- Invariant neighbor metrics ---
+# -----------------------------
+
+
+neighbor_avg_rate <- neighbor_edges %>%
+  dplyr::left_join(
+    master_base %>%
+      dplyr::select(mun, Year, rate) %>%
+      dplyr::rename(neighbor_mun = mun, neighbor_year = Year),
+    by = c("neighbor_mun" = "neighbor_mun", "Year" = "neighbor_year")
+  ) %>%
+  dplyr::group_by(mun, Year) %>%
+  dplyr::summarise(
+    avg_rate_neighbors = if (all(is.na(rate))) NA_real_ else mean(rate, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Add invariant neighbor metrics to master base
+master_base <- master_base %>%
+  dplyr::left_join(neighbor_avg_rate, by = c("mun", "Year"))
+
+# -----------------------------
+# --- Scenario builder ---
+# -----------------------------
+
+build_scenario_cols <- function(threshold_value, scenario_name) {
+
+  # Determine treatment status per threshold 
+  treatment_status <- narco_df %>%
+    dplyr::mutate(
+      trt = if (!is.na(threshold_value)) rate > threshold_value else reports > 0
+    ) %>%
+    dplyr::arrange(mun, Year) %>%
+    dplyr::group_by(mun) %>%
+    dplyr::mutate(
+      ever = cumsum(trt) > 0, 
+      yrs  = cumsum(trt)   
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(mun, Year, trt, ever, yrs)
+
+  # Bring neighbor treatment info for this scenario
+  neighbors_long <- neighbor_edges %>%
+    dplyr::left_join(
+      treatment_status %>%
+        dplyr::rename(
+          neighbor_mun  = mun,
+          neighbor_year = Year,
+          n_trt         = trt,
+          n_yrs         = yrs
+        ),
+      by = c("neighbor_mun" = "neighbor_mun", "Year" = "neighbor_year")
+    )
+
+  # Neighbor treatment metrics for this scenario
+  neighbor_metrics <- neighbors_long %>%
+    dplyr::group_by(mun, Year) %>%
+    dplyr::summarise(
+      pn_trt  = if (all(is.na(n_trt))) NA_real_ else mean(n_trt, na.rm = TRUE),
+      avg_yrs = if (all(is.na(n_yrs))) NA_real_ else mean(n_yrs, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  # Combine treatment status and neighbor metrics for the scenario
+  treatment_final <- treatment_status %>%
+    dplyr::left_join(neighbor_metrics, by = c("mun", "Year"))
+
+  # Suffix scenario-dependent columns only
+  non_keys <- setdiff(names(treatment_final), c("mun", "Year"))
+  names(treatment_final)[names(treatment_final) %in% non_keys] <-
+    paste0(non_keys, "_", scenario_name)
+
+  treatment_final
+}
+
+# -----------------------------
+# --- Build all scenarios ---
+# -----------------------------
+
+scenario_tables <- purrr::map2(all_thresholds, all_names, build_scenario_cols)
+
+master_all <- purrr::reduce(
+  scenario_tables,
+  .init = master_base, 
+  .f = ~ dplyr::left_join(.x, .y, by = c("mun", "Year"))
+)
+
+# -----------------------------
+# --- Write output file ---
+# -----------------------------
+dir.create("data/treatment", recursive = TRUE, showWarnings = FALSE)
+readr::write_csv(master_all, "data/treatment/all_treatments.csv")
+
+```
+
+
+
+```{r}
+# Load the single combined dataset
+df <- read_csv("data/treatment/all_treatments.csv")
+
+# Identify scenario-specific treated and ever-treated columns
+trt_cols  <- grep("^trt_",  names(df), value = TRUE)   # current-year treated
+ever_cols <- grep("^ever_", names(df), value = TRUE)   # ever treated
+
+# Build summary: annual treated share and cumulative (ever) treated share
+summary_treated <- purrr::map_dfr(trt_cols, function(trt_col) {
+  
+  # Determine the matching ever-treated column name
+  ever_col <- sub("^trt_", "ever_", trt_col)
+  
+  # Skip if the matching ever column doesn't exist
+  if (!(ever_col %in% ever_cols)) return(NULL)
+  
+  df %>%
+    dplyr::select(Year, !!sym(trt_col), !!sym(ever_col)) %>%
+    rename(trt = !!sym(trt_col), ever = !!sym(ever_col)) %>%
+    group_by(Year) %>%
+    summarise(
+      total_muns  = n(),
+      treated     = sum(as.numeric(trt),  na.rm = TRUE),
+      pct_treated = treated / total_muns,
+      ever_count  = sum(as.numeric(ever), na.rm = TRUE),
+      pct_ever    = ever_count / total_muns,
+      .groups     = "drop"
+    ) %>%
+    mutate(scenario = sub("^trt_", "", trt_col))
+})
+
+# Arrange for clarity
+summary_treated <- summary_treated %>%
+  arrange(scenario, Year)
+
+
+```
+
+```{r}
+# -----------------------------
+# --- Prepare plotting dataset (percentiles only) ---
+# -----------------------------
+
+plot_df <- summary_treated %>%
+  dplyr::mutate(
+    scenario = tidyr::replace_na(scenario, "unknown"),
+    perc_num_raw = stringr::str_extract(scenario, "(?<=percentile_)[0-9]+"),
+    perc_num     = suppressWarnings(as.integer(perc_num_raw)),
+    threshold    = dplyr::case_when(
+      !is.na(perc_num) & perc_num == 0 ~ "At least one report",
+      !is.na(perc_num)                 ~ as.character(perc_num),
+      TRUE                             ~ scenario
+    )
+  ) %>%
+  dplyr::filter(!is.na(pct_treated), !is.na(perc_num))
+
+# -----------------------------
+# --- Factor ordering (0..90) ---
+# -----------------------------
+
+lev <- plot_df %>%
+  dplyr::arrange(perc_num) %>%
+  dplyr::pull(threshold) %>%
+  unique()
+
+plot_df <- plot_df %>%
+  dplyr::mutate(threshold = factor(threshold, levels = lev, ordered = TRUE))
+
+# -----------------------------
+# --- Plot ---
+# -----------------------------
+
+treated <- ggplot2::ggplot(plot_df, ggplot2::aes(x = Year, y = pct_treated, color = threshold, group = threshold)) +
+  ggplot2::geom_line(linewidth = 0.9, na.rm = TRUE) +
+  ggplot2::geom_point(size = 2, na.rm = TRUE) +
+  ggplot2::scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  ggplot2::scale_x_continuous(breaks = seq(min(plot_df$Year), max(plot_df$Year), by = 3)) +
+  ggplot2::labs(
+    title = "Share of Treated Municipalities per Year by Percentile Threshold",
+    x = "Year",
+    y = "Treated Share",
+    color = "Percentile"
+  ) +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(
+    plot.title  = ggplot2::element_text(size = 15, hjust = 0.5, face = "bold"),
+    axis.text.x = ggplot2::element_text(size = 12),
+    axis.text.y = ggplot2::element_text(size = 12),
+    legend.position = "right"
+  )
+
+ggsave("treated.png", plot = treated, width = 10, height = 8, dpi = 300)
+
+```
+
+
+```{r}
+
+# -----------------------------
+# --- Prepare plotting dataset for ever-treated share (percentiles only) ---
+# -----------------------------
+
+plot_ever <- summary_treated %>%
+  dplyr::mutate(
+    scenario = tidyr::replace_na(scenario, "unknown"),
+    perc_num_raw = stringr::str_extract(scenario, "(?<=percentile_)[0-9]+"),
+    perc_num     = suppressWarnings(as.integer(perc_num_raw)),
+    threshold    = dplyr::case_when(
+      !is.na(perc_num) & perc_num == 0 ~ "At least one report",
+      !is.na(perc_num) ~ as.character(perc_num),
+      TRUE             ~ scenario
+    )
+  ) %>%
+  dplyr::filter(!is.na(pct_ever), !is.na(perc_num))
+
+# -----------------------------
+# --- Factor ordering (0..90) ---
+# -----------------------------
+
+lev <- plot_ever %>%
+  dplyr::arrange(perc_num) %>%
+  dplyr::pull(threshold) %>%
+  unique()
+
+plot_ever <- plot_ever %>%
+  dplyr::mutate(threshold = factor(threshold, levels = lev, ordered = TRUE))
+
+# -----------------------------
+# --- Plot ---
+# -----------------------------
+
+ever <- ggplot2::ggplot(plot_ever, ggplot2::aes(x = Year, y = pct_ever, color = threshold, group = threshold)) +
+  ggplot2::geom_line(linewidth = 0.9, na.rm = TRUE) +
+  ggplot2::geom_point(size = 2, na.rm = TRUE) +
+  ggplot2::scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  ggplot2::labs(
+    title = "Share of Ever-Treated Municipalities per Year by Percentile Threshold",
+    x = "Year",
+    y = "Ever-Treated Share",
+    color = "Percentile"
+  ) +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(
+    plot.title   = ggplot2::element_text(size = 15, hjust = 0.5, face = "bold"),
+    axis.text.x  = ggplot2::element_text(size = 12),
+    axis.text.y  = ggplot2::element_text(size = 12),
+    legend.position = "right"
+  )
+
+ggsave("ever_treated.png", plot = ever, width = 10, height = 8, dpi = 300)
+
+```
+

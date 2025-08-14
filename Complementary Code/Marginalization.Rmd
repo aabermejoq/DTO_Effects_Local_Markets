@@ -1,0 +1,168 @@
+---
+title: "Marginalization"
+output: html_document
+date: "2025-05-28"
+---
+
+This code loads CONAPO marginalization datasets across years, cleans and merges them, and interpolates missing annual values to build a complete municipality-year panel.
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+```
+
+```{r}
+
+load_required_packages <- function(pkgs) {
+  for (pkg in pkgs) {
+    if (!requireNamespace(pkg, quietly = TRUE)) {
+      install.packages(pkg)
+    }
+    library(pkg, character.only = TRUE)
+  }
+}
+
+load_required_packages(c("dplyr", "tidyr", "readr", "purrr", "janitor", "scales", "knitr"))
+
+
+```
+
+
+```{r}
+# -----------------------------------------
+# Function to load and bind multiple CSV files
+# -----------------------------------------
+
+load_marginalization_csvs <- function(folder_path) {
+  files <- list.files(path = folder_path, pattern = "\\.csv$", full.names = TRUE)
+
+  df_list <- lapply(files, function(file) {
+    year <- as.numeric(gsub("[^0-9]", "", basename(file)))
+    df <- read.csv(file)
+    df$YEAR <- year
+    return(df)
+  })
+
+  combined_df <- bind_rows(df_list)
+  return(combined_df)
+}
+```
+
+
+```{r}
+# -----------------------------------------
+# Load raw marginalization data
+# -----------------------------------------
+
+raw_margin_data <- load_marginalization_csvs("Data/Marginacion")
+
+# -----------------------------------------
+# Reshape IM_2010, IM_2015, IM_2020 into long format
+# -----------------------------------------
+
+im_data <- raw_margin_data %>%
+  dplyr::select(CVE_MUN, starts_with("IM_")) %>%
+  pivot_longer(
+    cols = starts_with("IM_"),
+    names_to = "YEAR",
+    names_prefix = "IM_",
+    values_to = "IM"
+  ) %>%
+  mutate(YEAR = as.numeric(YEAR))
+```
+
+
+```{r}
+# -----------------------------------------
+# Clean the rest of the marginalization variables
+# -----------------------------------------
+
+margin_clean <- raw_margin_data %>%
+  dplyr::select(
+    -starts_with("GM_"), -starts_with("IMN_"),
+    -starts_with("IM_"),  # remove IM_ columns (already reshaped)
+    -ENTIDAD, -NOM_ENT_etq, -NOM_ENT, -CVE_ENT, -NOM_MUN, -POB_TOT
+  ) %>%
+  mutate(
+    PL_5000 = ifelse(is.na(PL_5000), PL.5000, PL_5000)
+  ) %>%
+  dplyr::select(-PL.5000)
+
+# -----------------------------------------
+# Merge reshaped IM data back into the cleaned dataset
+# -----------------------------------------
+
+margin_clean <- left_join(margin_clean, im_data, by = c("CVE_MUN", "YEAR"))
+margin_clean <- na.omit(margin_clean)
+```
+
+
+```{r}
+# -----------------------------------------
+# Prepare for interpolation
+# -----------------------------------------
+
+# Define ID columns and variables to interpolate
+id_vars <- c("CVE_MUN", "YEAR")
+vars_to_interpolate <- setdiff(names(margin_clean), id_vars)
+
+# Create full year panel (2010–2020) for each municipality
+full_years <- expand.grid(
+  CVE_MUN = unique(margin_clean$CVE_MUN),
+  YEAR = 2010:2020
+)
+
+# Merge with original data
+margin_full <- left_join(full_years, margin_clean, by = c("CVE_MUN", "YEAR"))
+```
+
+
+```{r}
+# -----------------------------------------
+# Linear interpolation function
+# -----------------------------------------
+
+interpolate_linear <- function(years, values) {
+  known_idx <- which(!is.na(values))
+  if (length(known_idx) == 0) return(rep(NA_real_, length(values)))
+  if (length(known_idx) == 1) return(rep(values[known_idx], length(values)))
+
+  interp_values <- numeric(length(values))
+  for (i in seq_along(known_idx)) {
+    current_idx <- known_idx[i]
+    interp_values[current_idx] <- values[current_idx]
+    if (i < length(known_idx)) {
+      next_idx <- known_idx[i + 1]
+      y_seq <- years[current_idx:next_idx]
+      steps <- length(y_seq) - 1
+      increments <- seq(0, 1, length.out = steps + 1)
+      interp_values[current_idx:next_idx] <- values[current_idx] +
+        increments * (values[next_idx] - values[current_idx])
+    }
+  }
+  return(interp_values)
+}
+```
+
+
+```{r}
+# -----------------------------------------
+# Apply interpolation across all variables and municipalities
+# -----------------------------------------
+
+marginalization <- margin_full %>%
+  group_by(CVE_MUN) %>%
+  mutate(across(all_of(vars_to_interpolate), ~ interpolate_linear(YEAR, .x))) %>%
+  ungroup() %>%
+  rename(Year = YEAR, CLAVE = CVE_MUN)
+
+write_csv(marginalization, file.path("data/output", "marginalization.csv"))
+
+```
+
+```{r}
+marginalization <- read_csv("data/output/marginalization.csv")
+kable(head(marginalization, 10))
+```
+

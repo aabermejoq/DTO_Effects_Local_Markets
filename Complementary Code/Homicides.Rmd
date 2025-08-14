@@ -1,0 +1,114 @@
+---
+title: "Homicides"
+output: html_document
+date: "2025-05-28"
+---
+
+This script processes oficial crime data at the municipality level to store the number of homicides since 2011 to 2019 per municipality in Mexico.
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+```
+
+```{r}
+
+load_required_packages <- function(pkgs) {
+  for (pkg in pkgs) {
+    if (!requireNamespace(pkg, quietly = TRUE)) {
+      install.packages(pkg)
+    }
+    library(pkg, character.only = TRUE)
+  }
+}
+
+required_packages <- c( "tidyr", "dplyr", "purrr", "readxl", "readr", "janitor", "scales",
+  "lubridate", "caret", "geosphere", "CBPS", "factoextra", "rddtools", "hrbrthemes", "rdrobust", "stringr", "tibble")
+
+load_required_packages(required_packages)
+
+
+```
+
+
+```{r}
+# -----------------------
+# Load and clean post-2015 homicide data (2015–2019)
+# -----------------------
+
+# Folder containing CSV files
+folder_path <- "data/delitos"
+
+# List all CSV files in the folder
+csv_files <- list.files(
+  path = folder_path,
+  pattern = "\\.csv$",
+  full.names = TRUE
+)
+
+# Read and combine all files, extract year from filename
+post2015_homicides <- csv_files %>%
+  map_df(~ {
+    year <- str_extract(basename(.x), "\\d{4}")
+    read_csv(.x, show_col_types = FALSE) %>%
+      mutate(Year = as.integer(year))
+  })
+
+# Aggregate by municipality and year
+post2015_clean <- post2015_homicides %>%
+  group_by(inegi_municipio, Year) %>%
+  summarise(
+    Homicidios = sum(carpetas, na.rm = TRUE),
+    tasa = mean(tasa, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  rename(CLAVE = inegi_municipio)
+```
+
+
+```{r}
+# -----------------------
+# Load and clean pre-2015 homicide data (2011–2014)
+# -----------------------
+
+delitos <- read_csv("data/delitos/delitos.csv", locale = locale(encoding = "Latin1"))
+
+# Reshape from wide to long format
+delitos_long <- delitos %>%
+  pivot_longer(
+    cols = ENERO:DICIEMBRE,
+    names_to = "month",
+    values_to = "casos"
+  ) %>%
+  mutate(
+    month = factor(month,
+                   levels = c("ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO", "JUNIO",
+                              "JULIO", "AGOSTO", "SEPTIEMBRE", "OCTUBRE", "NOVIEMBRE", "DICIEMBRE"),
+                   labels = 1:12),
+    fecha = as.Date(paste(`AÑO`, month, "01", sep = "-"), format = "%Y-%m-%d")
+  )
+
+# Filter for homicides and aggregate
+pre2015_clean <- delitos_long %>%
+  filter(MODALIDAD == "HOMICIDIOS") %>%
+  group_by(INEGI, AÑO) %>%
+  summarise(
+    Homicidios = sum(casos, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  rename(CLAVE = INEGI, Year = AÑO) %>%
+  filter(Year < 2015) %>%
+  mutate(tasa = NA_real_)
+```
+
+
+```{r}
+# -----------------------
+# Combine pre- and post-2015 datasets
+# -----------------------
+
+homicidios_combined <- bind_rows(pre2015_clean, post2015_clean)
+write_csv(homicidios_combined, file.path("data/output", "homicidios_combined.csv"))
+
+```

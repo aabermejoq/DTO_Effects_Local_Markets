@@ -1,0 +1,725 @@
+---
+title: "Treatment Effect Estimation"
+output: html_document
+date: "2025-05-28"
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+```
+
+```{r}
+
+load_required_packages <- function(pkgs) {
+  for (pkg in pkgs) {
+    if (!requireNamespace(pkg, quietly = TRUE)) {
+      install.packages(pkg)
+    }
+    library(pkg, character.only = TRUE)
+  }
+}
+
+required_packages <- c( "tidyr", "dplyr", "purrr", "readxl", "readr", "janitor", "ggplot2", "scales",
+  "lubridate", "caret", "randomForest", "geosphere", "MatchIt", "CBPS", "cobalt", "miceadds", "fixest",
+  "factoextra", "rddtools", "hrbrthemes", "rdrobust", "stringr", "tibble", "lmtest", "sandwich", "multiwayvcov", "kableExtra")
+
+load_required_packages(required_packages)
+
+
+```
+
+
+## Data Download 
+
+Load transactions data
+
+```{r}
+
+transactions <- read_csv("data/output/transactions.csv")
+
+```
+
+Load, filter and merge demographic data for 2011–2019 from CONAPO, keeping key indicators from relevant years.
+
+```{r}
+
+# Load raw demographic data from Excel
+demographics_raw <- read_xlsx("data/input/demograficos.xlsx")
+
+# Filter for years 2011–2019, select key variables, and rename year column
+demographics_clean <- demographics_raw %>%
+  filter(AÑO >= 2011, AÑO <= 2019) %>%
+  dplyr::select(CLAVE, NOM_ENT, NOM_MUN, AÑO, POB_MIT_MUN) %>%
+  rename(Year = AÑO)
+
+# Merge cleaned demographic data with annual financial inclusion data, dropping missing rows
+panel_data <- demographics_clean %>%
+  left_join(transactions, by = c("Year", "CLAVE")) %>%
+  na.omit()
+
+# Remove intermediate objects to free memory
+rm(transactions, df_list, demographics_raw, demographics_clean)
+
+```
+
+Load DENUE data
+
+```{r}
+
+market_averages <- read_csv("data/output/denue_market_averages.csv")
+UE_counts <- read_csv("data/output/denue_UE_counts.csv")
+prom_coords <- read_csv("data/output/prom_coords.csv")
+
+panel_data <- panel_data %>%
+  left_join(UE_counts, by = c("Year", "CLAVE"))  %>%
+  left_join(market_averages, by = "CLAVE")
+
+rm(join, datos_full, datos_interpolated, datos_completos, UE_counts, market_averages, margin_full,
+  full_years, raw_margin_data, margin_clean, marginalization)
+
+```
+
+
+## Random Forest to estimate missing values of Economic Units per Municipality
+
+```{r}
+# -----------------------------------------
+# Prepare Data for Random Forest
+# -----------------------------------------
+
+panel_data <- panel_data %>%
+  filter(Year >= 2012, Year <= 2019) 
+
+datos_rf <- panel_data %>%
+  dplyr::select(-NOM_MUN) %>%  
+  mutate(across(everything(), ~ if (is.character(.)) as.factor(.) else .))
+
+completos <- datos_rf %>% filter(!is.na(UE))
+faltantes <- datos_rf %>% filter(is.na(UE))
+
+set.seed(333)  
+
+train_index <- createDataPartition(completos$UE, p = 0.80, list = FALSE)
+train_data <- completos[train_index, ]
+test_data <- completos[-train_index, ]
+
+```
+
+
+```{r, eval = FALSE}
+# -----------------------------------------
+# Find the best mtry
+# -----------------------------------------
+
+tune_grid <- expand.grid(mtry = c(2, 4, 6, 8, 10, 12, 14, 16))
+control <- trainControl(method = "cv", number = 10)  
+
+modelo_tuneado <- train(
+  UE ~ . -CLAVE,
+  data = train_data,
+  method = "rf",
+  trControl = control,
+  tuneGrid = tune_grid,
+  ntree = 500,
+  importance = TRUE)
+
+
+
+```
+
+
+```{r, eval = FALSE}
+
+# -----------------------------------------
+# Bootstrap to calculate standard srrors 
+# -----------------------------------------
+
+set.seed(123)
+n_boot <- 100
+bootstrap_preds <- matrix(NA, nrow = nrow(test_data), ncol = n_boot)
+
+for (i in 1:n_boot) {
+  boot_sample <- train_data[sample(nrow(train_data), replace = TRUE), ]
+  
+  modelo_boot <- randomForest(
+    UE ~ . -CLAVE,
+    data = boot_sample,
+    mtry = 8,  
+    ntree = 500
+  )
+  
+  bootstrap_preds[, i] <- predict(modelo_boot, newdata = test_data)
+}
+
+```
+
+
+
+```{r, eval = FALSE}
+
+# -----------------------------------------
+# standard errors and visualization of predictions
+# -----------------------------------------
+
+#Calculate prediction summary 
+lower_ci <- apply(bootstrap_preds, 1, quantile, probs = 0.025, na.rm = TRUE)
+upper_ci <- apply(bootstrap_preds, 1, quantile, probs = 0.975, na.rm = TRUE)
+pred_mean <- rowMeans(bootstrap_preds)
+
+#Add predictions, intervals, and percentage error to test_data
+test_data <- test_data %>%
+  mutate(
+    pred_rf_boot = pred_mean,
+    lower_ci = lower_ci,
+    upper_ci = upper_ci,
+    perc_error = abs(pred_rf_boot - UE) / UE * 100  # % absolute error
+  )
+
+#Define axis limits (log10 scale from 1,000 to 100,000)
+limits <- c(1000, 100000)
+
+#Plot with color mapped to percentage error
+bootstrap <- ggplot(test_data, aes(x = UE, y = pred_rf_boot)) +
+  geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), width = 0.2, alpha = 0.5, color = "gray60") +
+  geom_point(aes(color = perc_error), size = 2, alpha = 0.9) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray40") +
+  scale_color_gradient(low = "forestgreen", high = "red", name = "% Error") +
+  scale_x_log10(
+    limits = limits,
+    breaks = c(1000, 10000, 100000),
+    labels = comma_format()
+  ) +
+  scale_y_log10(
+    limits = limits,
+    breaks = c(1000, 10000, 100000),
+    labels = comma_format()
+  ) +
+  coord_fixed(ratio = 1) +
+  labs(
+    title = "RF Predictions vs Observed (Log-Log) Colored by % Error",
+    x = "Observed Economic Units per Municipality",
+    y = "Predicted Economic Units per Municipality"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+ggsave("bootstrap.png", plot = bootstrap, width = 6.5, height = 5, units = "in", dpi = 300)
+
+
+
+```
+
+
+
+```{r, eval = FALSE}
+
+# -----------------------------------------
+# Visualization of Bootstrap errors 
+# -----------------------------------------
+
+error_df <- data.frame(
+  obs = rep(test_data$UE, times = n_boot),
+  pred = as.vector(bootstrap_preds)
+) %>%
+  mutate(
+    perc_error = 100 * (pred - obs) / obs  
+  )
+
+errors <- ggplot(error_df, aes(x = perc_error)) +
+  geom_histogram(binwidth = 2, fill = "#20B2AA", color = "white", alpha = 0.85) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray30") +
+  labs(
+    title = "Distribution of Prediction Errors Across All Bootstraps",
+    x = "Percentage Error (%)",
+    y = "Count"
+  ) +
+  coord_cartesian(ylim = c(0, 500)) +
+  theme_minimal()
+
+ggsave("errors_bootstrap.png", plot = errors, width = 6.5, height = 5, units = "in", dpi = 300)
+```
+
+
+
+
+
+
+```{r}
+
+# -----------------------------------------
+# Add predictions to the data set 
+# -----------------------------------------
+
+modelo_rf_final <- randomForest(
+  UE ~ . -CLAVE,
+  data = completos,
+  mtry = 8,
+  ntree = 500,
+  importance = TRUE
+)
+
+economic_units <- predict(modelo_rf_final, newdata = datos_rf)
+datos_rf$UE_pred <- economic_units 
+
+datos_rf$Year <- panel_data$Year 
+datos_rf$Nom <- panel_data$NOM_MUN
+
+
+rm(boot_sample, completos, contol, error_df, faltantes, modelo_boot, control, modelo_rf_final,
+   modelo_tuneado, test_data, train_data, tune_grid, bootstrap_preds, train_index, join_UE)
+```
+
+
+## Control Data 1: Homicides per Municipality
+
+```{r}
+
+homicidios_combined <- read_csv("data/delitos/homicidios_combined.csv")
+
+complete_control1 <- datos_rf %>%
+left_join(homicidios_combined, by = c("CLAVE", "Year"))
+
+
+complete_control1 <- complete_control1 %>%
+  group_by(CLAVE) %>%
+  mutate(
+    Homicidios = if_else(
+      is.na(Homicidios),
+      mean(Homicidios, na.rm = TRUE),
+      Homicidios
+    )
+  ) %>%
+  ungroup()
+
+complete_control1 <- complete_control1 %>%
+  mutate(
+    tasa = (Homicidios / POB_MIT_MUN) * 10000
+  )
+
+rm(homicidios_combined, datos_rf, panel_data)
+```
+
+## Control Data 2: Marginalization per Municipality
+
+```{r}
+marginalization <- read_csv("data/output/marginalization.csv")
+
+complete_control1 <- complete_control1 %>%
+  left_join(marginalization, by = c("Year", "CLAVE"))
+
+rm( join, datos_full, datos_interpolated, datos_completos,
+  full_years, raw_margin_data, margin_clean, marginalization)
+
+```
+
+## Control Data 3: Public Finances
+
+```{r}
+finanzas <- read_csv("data/output/finanzas.csv")
+
+# Join the financial metrics to the main dataframe by municipality and year
+complete_control2 <- complete_control1 %>% 
+  left_join(finanzas, by = c("CLAVE", "Year"))
+
+# Correct financial autonomy values for Mexico City (Ciudad de México) for specific years
+complete_control2 <- complete_control2 %>%
+  mutate(
+    financial_autonomy = case_when(
+      NOM_ENT == "Ciudad de México" & Year == 2012 ~ 41.154,
+      NOM_ENT == "Ciudad de México" & Year == 2013 ~ 37.675,
+      NOM_ENT == "Ciudad de México" & Year == 2014 ~ 38.245,
+      NOM_ENT == "Ciudad de México" & Year == 2015 ~ 40.589,
+      NOM_ENT == "Ciudad de México" & Year == 2016 ~ 39.237,
+      NOM_ENT == "Ciudad de México" & Year == 2017 ~ 40.308,
+      NOM_ENT == "Ciudad de México" & Year == 2018 ~ 40.951,
+      NOM_ENT == "Ciudad de México" & Year == 2019 ~ 41.626,
+      TRUE ~ investment_capacity  # For all other cases, use investment capacity as fallback
+    )
+  )
+
+# Impute missing values for investment capacity and financial autonomy by municipality
+complete_control2 <- complete_control2 %>%
+  group_by(CLAVE) %>%
+  mutate(
+    investment_capacity = if_else(
+      is.na(investment_capacity),
+      mean(investment_capacity, na.rm = TRUE),  
+      investment_capacity
+    ),
+    financial_autonomy = if_else(
+      is.na(financial_autonomy),
+      mean(financial_autonomy, na.rm = TRUE),  
+      financial_autonomy
+    )
+  ) %>%
+  ungroup()
+
+rm(combined_df, complete_control1, finanzas)
+
+```
+
+## Control Data 4:State-level violence
+
+```{r}
+
+estados <- complete_control2 %>%
+  group_by(NOM_ENT, Year) %>%
+  mutate(tasa_estatal = mean(tasa, na.rm = TRUE)) %>%
+  ungroup()
+
+rm(complete_control2)
+
+```
+
+## Control Data 5: GDP dynamics per State 
+
+```{r}
+
+PIB <- read_csv("data/input/ITAEE.csv")
+
+PIB <- PIB  %>%
+  pivot_longer(
+    cols = -Year,          
+    names_to = "Estado",    
+    values_to = "PIB"    
+  )%>%
+  rename(NOM_ENT = Estado )
+
+PIB <- PIB %>%
+  arrange(NOM_ENT, Year) %>%
+  group_by(NOM_ENT) %>%
+  mutate(PIB_variacion_anual = round((PIB - lag(PIB)) / lag(PIB)*100, 4))
+
+
+final_base <- estados %>%
+  left_join(PIB, by = c("NOM_ENT", "Year")) 
+
+final_base <- final_base %>%
+  mutate(PIB_pc = PIB/ POB_MIT_MUN *1000000)
+
+rm(estados, PIB)
+
+```
+
+# Treatment Data Merge
+
+```{r}
+
+treatment_clean <- read_csv("data/treatment/all_treatments.csv")
+
+# Rename columns in the treatment dataset to match the naming convention in the main dataset
+treatment_clean <- treatment_clean %>%
+  rename(CLAVE = mun)
+
+# Merge treatment and geographic coordinate data into the main dataset
+df_complete <- final_base %>%
+  left_join(treatment_clean, by = c("CLAVE", "Year")) %>%
+  left_join(prom_coords, by = "CLAVE")
+
+# Columns to drop
+cols_to_drop <- c(
+  "Establecimientos","Transacciones","Sucursales","Cajeros","Operaciones","Terminales",
+  "Debito","Movil","Personal","Credito","UE",
+  "agriculture","business_support","construction","entertainment","finance","hospitality",
+  "management","manufacturing","media","mining","other_services","professional_services",
+  "real_estate","retail","transport","wholesale",
+  "micro_firms","small_firms","medium_firms", "ANALF", "SBASC", "OVSDE","OVSEE","OVSAE","OVPT","VHAC")
+
+df_complete <- dplyr::select(df_complete, -dplyr::any_of(cols_to_drop))
+
+```
+
+
+
+## Propensity Score 
+
+```{r}
+
+# -----------------------------
+# --- Add lag, lead, and % change ---
+# -----------------------------
+
+# Variables to be treated as IDs (excluded from transformations)
+id_vars <- c("CLAVE", "NOM_ENT", "Nom", "Year")
+
+# Candidate variables for transformations: exclude IDs and any previously derived variables
+base_vars <- setdiff(names(df_complete), id_vars)
+base_vars <- base_vars[!grepl("(_lag|_lead|_pct_change)$", base_vars)]
+
+# Numeric variables among candidates (used for percent change calculation)
+numeric_vars <- base_vars[sapply(df_complete[base_vars], is.numeric)]
+
+df_complete <- df_complete %>%
+  dplyr::group_by(CLAVE) %>%                 # Group operations by municipality
+  dplyr::arrange(Year, .by_group = TRUE) %>%
+  dplyr::mutate(
+    # Generate lag and lead for all non-ID variables
+    dplyr::across(
+      .cols = base_vars,
+      .fns  = list(
+        lag  = ~ dplyr::lag(.x, 1),
+        lead = ~ dplyr::lead(.x, 1)
+      ),
+      .names = "{.col}_{.fn}"
+    ),
+
+    # Calculate percent change for numeric variables only
+    dplyr::across(
+      .cols = numeric_vars,
+      .fns  = ~ ( .x - dplyr::lag(.x, 1) ) / abs(dplyr::lag(.x, 1)) * 100,
+      .names = "{.col}_pct_change"
+    )
+  ) %>%
+  dplyr::ungroup()
+
+```
+
+```{r}
+# -----------------------------
+# --- Create separate data frames ---
+# -----------------------------
+
+pct <- 0
+
+trt_var     <- paste0("trt_treatment_percentile_", pct)
+yrs_var     <- paste0("yrs_treatment_percentile_", pct)
+ever_var    <- paste0("ever_treatment_percentile_", pct)
+yrs_lag_var <- paste0(yrs_var, "_lag")
+trt_lag_var <- paste0(trt_var, "_lag")
+avg_yrs_lag <- paste0("avg_yrs_treatment_percentile_", pct, "_lag")
+pn_trt_lag  <- paste0("pn_trt_treatment_percentile_", pct, "_lag")
+
+requested <- c(
+  trt_var, trt_lag_var, yrs_var, yrs_lag_var, ever_var, avg_yrs_lag, pn_trt_lag,
+  "avg_rate_neighbors", "avg_rate_neighbors_lag","DTOs",
+  "DTOs_lag", "UE_pred_pct_change", "financial_autonomy_lag", "IM_lag", "big_firms", "UE_pred_lead",
+  "UE_pred", "UE_pred_lag", "PIB_variacion_anual", "POB_MIT_MUN_lag", "POB_MIT_MUN", "tasa_lag"
+)
+
+# -----------------------------
+# --- Robust select ---
+# -----------------------------
+df_matching <- df_complete %>%
+  dplyr::select(
+    CLAVE, NOM_ENT, Nom, Year,
+    dplyr::any_of(requested)
+  )
+
+# ---- Keep units untreated in 2012 baseline ----
+ids_2012_treated_0 <- df_matching %>%
+  dplyr::filter(Year == 2012, .data[[yrs_var]] == 0 ) %>%
+  dplyr::pull(CLAVE)
+
+# ---- Clean sample for matching ----
+df_matching_clean <- df_matching %>%
+  dplyr::filter(
+    CLAVE %in% ids_2012_treated_0,
+    !is.na(.data[[trt_var]]),
+    !is.na(UE_pred_lag),
+    !is.na(financial_autonomy_lag),
+    !is.na(.data[[pn_trt_lag]])
+  )
+
+# -----------------------------
+# --- MatchIt: full matching with percentile-specific treatment ---
+# -----------------------------
+match_formula <- stats::as.formula(
+  paste0(trt_var,
+         " ~ log10(UE_pred_lag) + avg_rate_neighbors_lag + tasa_lag + financial_autonomy_lag + IM_lag")
+)
+
+matchit_out  <- MatchIt::matchit(match_formula, method = "full", data = df_matching_clean)
+matched_data <- MatchIt::match.data(matchit_out)
+
+# -----------------------------
+# --- Balance plot ---
+# -----------------------------
+cobalt::love.plot(
+  matchit_out,
+  stats = "mean.diffs", abs = TRUE, thresholds = c(m = 0.1),
+  var.order = "unadjusted", binary = "std", stars = "none",
+  colors = c("blue", "red"), shapes = c("circle", "triangle"),
+  size = 5, line = FALSE, title = paste0("Standardized Mean Differences (p", pct, ")")
+) +
+  ggplot2::theme_minimal(base_size = 10) +
+  ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5, face = "bold"),
+                 legend.position = "bottom")
+
+summary(matchit_out)
+
+```
+
+```{r, eval=FALSE}
+
+# Percentiles to evaluate
+pct_vec <- seq(10, 70, by = 10)
+
+# Matching covariates (display labels optional; not used below)
+labels <- c(
+  "log10(UE_pred_lag)"      = "Y (t-1)",
+  "avg_rate_neighbors_lag"  = "R (t-1)",
+  "tasa_lag"                = "HR (t-1)",
+  "financial_autonomy_lag"  = "FA (t-1)",
+  "IM_lag"
+)
+match_covars <- names(labels)
+
+# Format a cell "coef*** (se)"; returns "--" if missing
+fmt_cell <- function(est, se, pval = NA_real_) {
+  if (!is.numeric(est) || !is.numeric(se) || is.na(est) || is.na(se)) return("--")
+  stars <- if (is.na(pval)) "" else if (pval < 0.01) "***" else if (pval < 0.05) "**" else if (pval < 0.10) "*" else ""
+  paste0(sprintf("%.3f", est), stars, " (", sprintf("%.3f", se), ")")
+}
+
+# Safely extract estimate, SE, and vcov index for a term (handles TRUE-suffix)
+get_coef <- function(fit, term_base) {
+  nm  <- names(coef(fit))
+  idx <- match(c(term_base, paste0(term_base, "TRUE")), nm, nomatch = 0L)
+  idx <- idx[idx > 0][1]
+  if (length(idx) == 0 || is.na(idx)) return(list(est = NA_real_, se = NA_real_, idx = NA_integer_))
+  est <- unname(coef(fit)[idx])
+  se  <- sqrt(vcov(fit)[idx, idx])
+  list(est = est, se = se, idx = idx)
+}
+
+# Per-percentile routine: matching, TWFE outcome, beta/gamma/theta with SE
+run_for_pct_table <- function(pct) {
+  trt_var     <- paste0("trt_treatment_percentile_", pct)
+  yrs_var     <- paste0("yrs_treatment_percentile_", pct)
+  trt_lag_var <- paste0(trt_var, "_lag")
+  yrs_lag_var <- paste0(yrs_var, "_lag")
+  avg_yrs_lag <- paste0("avg_yrs_treatment_percentile_", pct, "_lag")
+  pn_trt_lag  <- paste0("pn_trt_treatment_percentile_", pct, "_lag")
+
+  requested <- c(
+    trt_var, trt_lag_var, yrs_var, yrs_lag_var, avg_yrs_lag, pn_trt_lag,
+    "avg_rate_neighbors", "avg_rate_neighbors_lag",
+    "DTOs", "DTOs_lag",
+    "UE_pred_pct_change", "UE_pred", "UE_pred_lag", "UE_pred_lead",
+    "financial_autonomy_lag", "IM_lag", "big_firms",
+    "PIB_variacion_anual", "PIB_variacion_anual_lag",
+    "POB_MIT_MUN_lag", "POB_MIT_MUN", "tasa_lag"
+  )
+
+  df_matching <- df_complete %>%
+    dplyr::select(CLAVE, NOM_ENT, Nom, Year, dplyr::any_of(requested)) %>%
+    dplyr::mutate(DISPUTED = dplyr::case_when(is.na(DTOs) ~ NA_integer_, DTOs > 1 ~ 1L, TRUE ~ 0L))
+
+  ids_2012_treated_0 <- df_matching %>%
+    dplyr::filter(Year == 2012, .data[[yrs_var]] <= 0) %>%
+    dplyr::pull(CLAVE)
+
+  df_matching_clean <- df_matching %>%
+    dplyr::filter(
+      CLAVE %in% ids_2012_treated_0,
+      !is.na(.data[[trt_var]]),
+      !is.na(UE_pred_lag),
+      !is.na(financial_autonomy_lag),
+      !is.na(.data[[pn_trt_lag]])
+    )
+
+  match_formula <- stats::as.formula(
+    paste0(trt_var, " ~ ", paste(match_covars, collapse = " + "))
+  )
+
+  m_out <- try(MatchIt::matchit(match_formula, method = "full", data = df_matching_clean), silent = TRUE)
+  if (inherits(m_out, "try-error")) {
+    return(tibble::tibble(
+      Percentile = pct, Beta = "--", Gamma = "--", Theta = "--",
+      N_treated = NA_integer_, N_control = NA_integer_, N_total = NA_integer_
+    ))
+  }
+
+  matched_data <- MatchIt::match.data(m_out)
+  matched_data[[trt_var]] <- as.integer(matched_data[[trt_var]] == TRUE)
+
+  n_treated <- sum(matched_data[[trt_var]] == 1L, na.rm = TRUE)
+  n_control <- sum(matched_data[[trt_var]] == 0L, na.rm = TRUE)
+  n_total   <- nrow(matched_data)
+
+  matched_data$Year  <- as.factor(matched_data$Year)
+  matched_data$CLAVE <- as.factor(matched_data$CLAVE)
+
+  model_formula <- stats::as.formula(
+    paste0("UE_pred_pct_change ~ ", trt_lag_var, " + DISPUTED + PIB_variacion_anual + big_firms + CLAVE + Year")
+  )
+
+  fit <- try(
+    estimatr::lm_robust(
+      formula  = model_formula,
+      data     = matched_data,
+      weights  = matched_data$weights,
+      clusters = CLAVE,
+      se_type  = "stata"
+    ),
+    silent = TRUE
+  )
+
+  if (inherits(fit, "try-error")) {
+    return(tibble::tibble(
+      Percentile = pct, Beta = "--", Gamma = "--", Theta = "--",
+      N_treated = n_treated, N_control = n_control, N_total = n_total
+    ))
+  }
+
+  # beta (treated) and gamma (disputed)
+  b <- get_coef(fit, trt_lag_var)
+  g <- get_coef(fit, "DISPUTED")
+
+  # p-values for stars (from tidy)
+  tt <- broom::tidy(fit)
+  p_for <- function(tt, term_base) {
+    row <- tt %>% dplyr::filter(term %in% c(term_base, paste0(term_base, "TRUE"))) %>% dplyr::slice(1)
+    if (nrow(row) == 0) NA_real_ else row$p.value
+  }
+  p_beta  <- p_for(tt, trt_lag_var)
+  p_gamma <- p_for(tt, "DISPUTED")
+
+  # theta = beta + gamma and its SE from vcov
+  if (is.na(b$idx) || is.na(g$idx)) {
+    theta_est <- NA_real_; theta_se <- NA_real_; p_theta <- NA_real_
+  } else {
+    V <- vcov(fit)
+    cov_bg   <- V[b$idx, g$idx]
+    theta_est <- b$est + g$est
+    theta_var <- V[b$idx, b$idx] + V[g$idx, g$idx] + 2 * cov_bg
+    theta_se  <- if (is.finite(theta_var) && theta_var >= 0) sqrt(theta_var) else NA_real_
+    p_theta   <- if (is.na(theta_est) || is.na(theta_se) || theta_se == 0) NA_real_
+                 else 2 * pnorm(-abs(theta_est / theta_se))
+  }
+
+  tibble::tibble(
+    Percentile = pct,
+    Beta   = fmt_cell(b$est, b$se, p_beta),     # Treated
+    Gamma  = fmt_cell(g$est, g$se, p_gamma),    # Disputed
+    Theta  = fmt_cell(theta_est, theta_se, p_theta), # Total = beta + gamma
+    N_treated = n_treated,
+    N_control = n_control,
+    N_total   = n_total
+  )
+}
+
+# Run and export LaTeX table
+effects_tbl <- purrr::map_dfr(pct_vec, run_for_pct_table) %>%
+  dplyr::arrange(Percentile)
+
+latex_tab <- kbl(
+  effects_tbl,
+  format   = "latex",
+  booktabs = TRUE,
+  align    = c("r","c","c","c","r","r","r"),
+  caption  = "Effects by percentile: $\\beta_p$ (Treated), $\\gamma_p$ (Disputed), and $\\theta_p=\\beta_p+\\gamma_p$ with cluster-robust standard errors (municipality) and post-matching sample sizes.",
+  col.names = c("Percentile", "$\\beta_p$ (Treated)", "$\\gamma_p$ (Disputed)", "$\\theta_p$ (Total)", "N (Treated)", "N (Control)", "N (Total)"),
+  escape   = FALSE
+) %>%
+  kable_styling(latex_options = c("hold_position", "striped", "condensed")) %>%
+  row_spec(0, bold = TRUE)
+
+kableExtra::save_kable(latex_tab, "effects_beta_gamma_theta.tex")
+message("LaTeX table saved to: ", normalizePath("effects_beta_gamma_theta.tex"))
+
+
+
+```

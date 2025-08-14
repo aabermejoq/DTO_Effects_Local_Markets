@@ -1,0 +1,208 @@
+---
+title: "DENUE"
+output: html_document
+date: "2025-05-28"
+---
+
+This script processes DENUE microdata (2015 and 2019), classifies establishments by economic sector and firm size, and calculates the share of firms by category and sector at the municipality level.
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+```
+
+```{r}
+
+load_required_packages <- function(pkgs) {
+  for (pkg in pkgs) {
+    if (!requireNamespace(pkg, quietly = TRUE)) {
+      install.packages(pkg)
+    }
+    library(pkg, character.only = TRUE)
+  }
+}
+
+load_required_packages(c("dplyr", "tidyr", "readr", "purrr", "janitor", "scales", "knitr"))
+
+
+```
+
+
+```{r}
+# -----------------------------------------
+# Load DENUE datasets (2015 & 2019)
+# -----------------------------------------
+
+denue_2015 <- read_csv("DENUE/denue_filtrado_2015.csv", show_col_types = FALSE)
+denue_2019 <- read_csv("DENUE/denue_filtrado_2019.csv", show_col_types = FALSE)
+
+# -----------------------------------------
+# Function to classify economic sector and firm size
+# -----------------------------------------
+
+classify_sector <- function(df, year) {
+  df %>%
+    mutate(
+      # Unique municipality ID
+      CLAVE = (cve_ent * 1000) + cve_mun,
+
+      # Extract 2-digit NAICS code
+      naics_2digit = floor(codigo_act / 10000),
+
+      # Sector classification
+      sector = case_when(
+        naics_2digit == 11 ~ "agriculture",
+        naics_2digit == 21 ~ "mining",
+        naics_2digit == 22 ~ "utilities",
+        naics_2digit == 23 ~ "construction",
+        naics_2digit %in% 31:33 ~ "manufacturing",
+        naics_2digit == 43 ~ "wholesale",
+        naics_2digit == 46 ~ "retail",
+        naics_2digit %in% 48:49 ~ "transport",
+        naics_2digit == 51 ~ "media",
+        naics_2digit == 52 ~ "finance",
+        naics_2digit == 53 ~ "real_estate",
+        naics_2digit == 54 ~ "professional_services",
+        naics_2digit == 55 ~ "management",
+        naics_2digit == 56 ~ "business_support",
+        naics_2digit == 61 ~ "education",
+        naics_2digit == 62 ~ "health",
+        naics_2digit == 71 ~ "entertainment",
+        naics_2digit == 72 ~ "hospitality",
+        naics_2digit == 81 ~ "other_services",
+        naics_2digit == 93 ~ "public_admin",
+        TRUE ~ "other"
+      ),
+
+      # Year assignment
+      Year = year,
+
+      # Firm size classification
+      micro_firm  = if_else(per_ocu == "0 a 5 personas", 1L, 0L),
+      small_firm  = if_else(per_ocu %in% c("6 a 10 personas", "11 a 30 personas"), 1L, 0L),
+      medium_firm = if_else(per_ocu %in% c("31 a 50 personas", "51 a 100 personas"), 1L, 0L),
+      big_firm    = if_else(per_ocu %in% c("101 a 250 personas", "251 y más personas"), 1L, 0L)
+    )
+}
+```
+
+
+```{r}
+# -----------------------------------------
+# Apply classification to both years and combine
+# -----------------------------------------
+
+denue_2015 <- classify_sector(denue_2015, 2015)
+denue_2019 <- classify_sector(denue_2019, 2019)
+
+denue <- bind_rows(denue_2015, denue_2019)
+```
+
+
+```{r}
+# -----------------------------------------
+# Filter out public sector, education, health, and utilities
+# -----------------------------------------
+
+excluded_codes <- c(93, 61, 62, 22)
+
+denue <- denue %>%
+  filter(!(naics_2digit %in% excluded_codes))
+
+# -----------------------------------------
+# Summarise firm size by municipality and year
+# -----------------------------------------
+
+firm_totals <- denue %>%
+  group_by(CLAVE, Year) %>%
+  summarise(
+    UE = n(),
+    micro_firms  = sum(micro_firm, na.rm = TRUE),
+    small_firms  = sum(small_firm, na.rm = TRUE),
+    medium_firms = sum(medium_firm, na.rm = TRUE),
+    big_firms    = sum(big_firm, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+
+```{r}
+# -----------------------------------------
+# Calculate sector shares
+# -----------------------------------------
+
+sector_shares <- denue %>%
+  group_by(CLAVE, Year, sector) %>%
+  summarise(n_firms_sector = n(), .groups = "drop") %>%
+  left_join(firm_totals, by = c("CLAVE", "Year")) %>%
+  mutate(sector_share = n_firms_sector / UE)
+
+# -----------------------------------------
+# Convert sector shares to wide format
+# -----------------------------------------
+
+sector_wide <- sector_shares %>%
+  dplyr::select(CLAVE, Year, sector, sector_share) %>%
+  pivot_wider(
+    names_from = sector,
+    values_from = sector_share,
+    values_fill = 0
+  ) %>%
+  left_join(firm_totals, by = c("CLAVE", "Year"))
+
+# -----------------------------------------
+# Convert firm sizes to percentages
+# -----------------------------------------
+
+sector_wide <- sector_wide %>%
+  mutate(
+    micro_firms  = round(micro_firms / UE * 100, 2),
+    small_firms  = round(small_firms / UE * 100, 2),
+    medium_firms = round(medium_firms / UE * 100, 2),
+    big_firms    = round(big_firms / UE * 100, 2)
+  )
+```
+
+
+```{r}
+# -----------------------------------------
+# Calculate average sectoral composition per municipality
+# -----------------------------------------
+
+UE_counts <- sector_wide %>%
+  dplyr::select(CLAVE, Year, UE)
+
+market_averages <- sector_wide %>%
+  group_by(CLAVE) %>%
+  summarise(
+    across(.cols = -c(Year, UE), .fns = mean, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# -----------------------------------------
+# Save final outputs
+# -----------------------------------------
+
+write_csv(market_averages, "data/output/denue_market_averages.csv")
+write_csv(UE_counts, "data/output/denue_UE_counts.csv")
+```
+
+
+```{r}
+# -----------------------------------------
+# Save coordenates
+# -----------------------------------------
+
+prom_coords <- denue_2015 %>%
+  group_by(CLAVE) %>%
+  summarise(
+    lat_prom = mean(latitud, na.rm = TRUE),
+    lon_prom = mean(longitud, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write_csv(prom_coords, "data/output/prom_coords.csv")
+
+
+```

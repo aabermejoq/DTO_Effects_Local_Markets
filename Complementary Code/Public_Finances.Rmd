@@ -1,0 +1,85 @@
+---
+title: "Public Finances"
+output: html_document
+date: "2025-05-28"
+---
+
+This script processes official data on public finances at the municipality level. 
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+```
+
+```{r}
+
+load_required_packages <- function(pkgs) {
+  for (pkg in pkgs) {
+    if (!requireNamespace(pkg, quietly = TRUE)) {
+      install.packages(pkg)
+    }
+    library(pkg, character.only = TRUE)
+  }
+}
+
+required_packages <- c( "tidyr", "dplyr", "purrr", "readxl", "readr", "janitor", "scales",
+  "lubridate", "caret", "geosphere", "CBPS", "factoextra", "rddtools", "hrbrthemes", "rdrobust", "stringr", "tibble")
+
+load_required_packages(required_packages)
+
+
+```
+
+
+```{r, eval=FALSE}
+
+#  Folder path 
+folder <- "data/finanzas"  # Replace with the actual path
+
+# Get list of all CSV files in the folder with full paths
+file_list <- list.files(path = folder, pattern = "\\.csv$", full.names = TRUE)
+
+# Read and combine all CSV files into one dataframe
+data_total <- do.call(rbind, lapply(file_list, read.csv))
+
+# Create a unique municipality key by combining entity and municipality IDs
+data_total <- data_total %>% 
+  mutate(CLAVE = (ID_ENTIDAD * 1000) + ID_MUNICIPIO) %>% 
+  rename(Year = ANIO)
+
+# Filter and calculate expenditure metrics
+egresos <- data_total %>% 
+  filter(TEMA == "Egresos") %>% 
+  group_by(CLAVE, Year) %>% 
+  summarise(
+    total_expenditure = sum(VALOR[DESCRIPCION_CATEGORIA == "Total de egresos"], na.rm = TRUE),
+    public_investment = sum(VALOR[DESCRIPCION_CATEGORIA == "Inversión pública"], na.rm = TRUE),
+    .groups = "drop"
+  ) %>% 
+  # Calculate investment capacity as a percentage of total expenditures
+  mutate(investment_capacity = round((public_investment / total_expenditure) * 100, 2)) %>% 
+  dplyr::select(CLAVE, Year, investment_capacity)
+
+# Filter and calculate revenue metrics
+ingresos <- data_total %>% 
+  filter(TEMA == "Ingresos") %>% 
+  group_by(CLAVE, Year) %>% 
+  summarise(
+    total_revenue = sum(VALOR[DESCRIPCION_CATEGORIA == "Total de ingresos"], na.rm = TRUE),
+    own_revenue = sum(VALOR[DESCRIPCION_CATEGORIA %in% c(
+      "Impuestos", "Aprovechamientos", "Derechos", "Contribuciones de Mejoras"
+    )], na.rm = TRUE),
+    .groups = "drop"
+  ) %>% 
+  # Calculate financial autonomy as the percentage of own revenue over total revenue
+  mutate(financial_autonomy = round((own_revenue / total_revenue) * 100, 2)) %>% 
+  dplyr::select(CLAVE, Year, financial_autonomy)
+
+# Combine expenditure and revenue metrics into one final dataframe
+finanzas <- left_join(egresos, ingresos, by = c("CLAVE", "Year"))
+
+# Export the final combined dataset to CSV
+write.csv(finanzas, "data/output/finanzas.csv", row.names = FALSE)
+
+```
